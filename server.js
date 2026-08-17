@@ -9,18 +9,20 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 
 if (!DEEPGRAM_API_KEY) {
     throw new Error(
-        "DEEPGRAM_API_KEY belum diisi di file .env"
+        "DEEPGRAM_API_KEY belum diisi."
     );
 }
 
 const app = express();
 
 app.use(cors());
+app.use(express.json());
 
 app.get("/", (req, res) => {
     res.json({
         ok: true,
-        service: "CallText STT Server"
+        service: "CallText STT Server",
+        status: "running"
     });
 });
 
@@ -33,7 +35,13 @@ const wss = new WebSocket.Server({
 
 wss.on("connection", (client) => {
 
+    console.log("=================================");
     console.log("Android terhubung ke STT");
+    console.log("=================================");
+
+    let keepAliveTimer = null;
+    let clientClosed = false;
+    let deepgramClosed = false;
 
     const deepgramUrl =
         "wss://api.deepgram.com/v1/listen" +
@@ -44,7 +52,8 @@ wss.on("connection", (client) => {
         "&channels=1" +
         "&smart_format=true" +
         "&interim_results=true" +
-        "&endpointing=500";
+        "&endpointing=500" +
+        "&punctuate=true";
 
     const deepgram =
         new WebSocket(deepgramUrl, {
@@ -54,6 +63,10 @@ wss.on("connection", (client) => {
             }
         });
 
+    // =====================================================
+    // DEEPGRAM CONNECTED
+    // =====================================================
+
     deepgram.on("open", () => {
 
         console.log(
@@ -61,70 +74,194 @@ wss.on("connection", (client) => {
         );
 
         if (
-            client.readyState === WebSocket.OPEN
+            client.readyState ===
+            WebSocket.OPEN
         ) {
+
             client.send(
                 JSON.stringify({
                     type: "ready"
                 })
             );
         }
+
+        /*
+         * KeepAlive dikirim sebagai TEXT frame.
+         * Berguna menjaga stream tetap aktif saat
+         * tidak ada audio sesaat.
+         */
+        keepAliveTimer =
+            setInterval(() => {
+
+                if (
+                    deepgram.readyState ===
+                    WebSocket.OPEN
+                ) {
+
+                    try {
+
+                        deepgram.send(
+                            JSON.stringify({
+                                type: "KeepAlive"
+                            })
+                        );
+
+                        console.log(
+                            "🔄 Deepgram KeepAlive"
+                        );
+
+                    } catch (error) {
+
+                        console.error(
+                            "KeepAlive error:",
+                            error.message
+                        );
+                    }
+                }
+
+            }, 5000);
     });
+
+    // =====================================================
+    // DEEPGRAM MESSAGE
+    // =====================================================
 
     deepgram.on("message", (data) => {
 
-console.log(
-    "Response Deepgram:",
-    data.toString()
-);
+        const raw =
+            data.toString();
+
+        console.log(
+            "Response Deepgram:",
+            raw
+        );
+
         try {
 
             const message =
-                JSON.parse(
-                    data.toString()
-                );
+                JSON.parse(raw);
+
+            // ---------------------------------------------
+            // DEEPGRAM ERROR
+            // ---------------------------------------------
 
             if (
-                message.type === "Results"
+                message.type ===
+                "Error"
             ) {
 
-                const transcript =
-                    message.channel
-                        ?.alternatives?.[0]
-                        ?.transcript || "";
+                console.error(
+                    "❌ Deepgram Error:",
+                    raw
+                );
 
                 if (
-                    transcript.trim() !== "" &&
                     client.readyState ===
-                        WebSocket.OPEN
+                    WebSocket.OPEN
                 ) {
 
                     client.send(
                         JSON.stringify({
-                            type: "transcript",
-                            text: transcript,
-                            isFinal:
-                                message.is_final === true,
-                            speechFinal:
-                                message.speech_final === true
+                            type: "error",
+                            message:
+                                message.message ||
+                                "Deepgram error"
                         })
                     );
+                }
+
+                return;
+            }
+
+            // ---------------------------------------------
+            // TRANSCRIPT
+            // ---------------------------------------------
+
+            if (
+                message.type ===
+                "Results"
+            ) {
+
+                const transcript =
+                    message
+                        .channel
+                        ?.alternatives?.[0]
+                        ?.transcript || "";
+
+                const isFinal =
+                    message.is_final === true;
+
+                const speechFinal =
+                    message.speech_final === true;
+
+                if (
+                    transcript.trim() !== ""
+                ) {
+
+                    console.log(
+                        "📝 Transcript:",
+                        transcript
+                    );
+
+                    console.log(
+                        "   is_final:",
+                        isFinal
+                    );
+
+                    console.log(
+                        "   speech_final:",
+                        speechFinal
+                    );
+
+                    if (
+                        client.readyState ===
+                        WebSocket.OPEN
+                    ) {
+
+                        const payload =
+                            JSON.stringify({
+
+                                type:
+                                    "transcript",
+
+                                text:
+                                    transcript,
+
+                                isFinal:
+                                    isFinal,
+
+                                speechFinal:
+                                    speechFinal
+                            });
+
+                        client.send(
+                            payload
+                        );
+
+                        console.log(
+                            "➡️ Transcript dikirim ke Android"
+                        );
+                    }
                 }
             }
 
         } catch (error) {
 
             console.error(
-                "Error membaca Deepgram:",
+                "❌ Error parsing Deepgram:",
                 error.message
             );
         }
     });
 
+    // =====================================================
+    // DEEPGRAM ERROR
+    // =====================================================
+
     deepgram.on("error", (error) => {
 
         console.error(
-            "❌ Deepgram error:",
+            "❌ Deepgram WebSocket error:",
             error.message
         );
 
@@ -143,60 +280,277 @@ console.log(
         }
     });
 
-    deepgram.on("close", () => {
+    // =====================================================
+    // DEEPGRAM CLOSE
+    // =====================================================
+
+    deepgram.on("close", (
+        code,
+        reason
+    ) => {
+
+        deepgramClosed =
+            true;
+
+        if (
+            keepAliveTimer
+        ) {
+
+            clearInterval(
+                keepAliveTimer
+            );
+
+            keepAliveTimer =
+                null;
+        }
 
         console.log(
-            "Koneksi Deepgram ditutup"
+            "🔴 Koneksi Deepgram ditutup"
+        );
+
+        console.log(
+            "Code:",
+            code
+        );
+
+        console.log(
+            "Reason:",
+            reason.toString()
         );
 
         if (
+            !clientClosed &&
             client.readyState ===
             WebSocket.OPEN
         ) {
-            client.close();
+
+            client.send(
+                JSON.stringify({
+                    type: "error",
+                    message:
+                        "Koneksi Deepgram ditutup"
+                })
+            );
         }
     });
 
-client.on("message", (data, isBinary) => {
+    // =====================================================
+    // ANDROID MESSAGE
+    // =====================================================
 
-    if (!isBinary) {
-        console.log("Pesan non-binary dari Android:", data.toString());
-        return;
-    }
+    client.on(
+        "message",
+        (data, isBinary) => {
 
-    console.log(
-        `Audio masuk dari Android: ${data.length} bytes`
+            if (clientClosed) {
+                return;
+            }
+
+            /*
+             * Android mengirim:
+             * - binary = PCM audio
+             * - text = command seperti finish
+             */
+
+            if (!isBinary) {
+
+                const text =
+                    data.toString();
+
+                console.log(
+                    "Pesan text dari Android:",
+                    text
+                );
+
+                try {
+
+                    const message =
+                        JSON.parse(
+                            text
+                        );
+
+                    // -----------------------------------------
+                    // FINISH
+                    // -----------------------------------------
+
+                    if (
+                        message.type ===
+                        "finish"
+                    ) {
+
+                        console.log(
+                            "🛑 Finish dari Android"
+                        );
+
+                        if (
+                            deepgram.readyState ===
+                            WebSocket.OPEN
+                        ) {
+
+                            /*
+                             * Close normal agar Deepgram
+                             * mengeluarkan final result terakhir.
+                             */
+                            deepgram.close(
+                                1000,
+                                "Android finished"
+                            );
+                        }
+
+                        return;
+                    }
+
+                    // -----------------------------------------
+                    // KEEP ALIVE REQUEST
+                    // -----------------------------------------
+
+                    if (
+                        message.type ===
+                        "KeepAlive"
+                    ) {
+
+                        if (
+                            deepgram.readyState ===
+                            WebSocket.OPEN
+                        ) {
+
+                            deepgram.send(
+                                JSON.stringify({
+                                    type:
+                                        "KeepAlive"
+                                })
+                            );
+                        }
+
+                        return;
+                    }
+
+                } catch (error) {
+
+                    console.log(
+                        "Pesan text bukan JSON."
+                    );
+                }
+
+                return;
+            }
+
+            // =================================================
+            // BINARY AUDIO
+            // =================================================
+
+            console.log(
+                `🎙️ Audio masuk dari Android: ${data.length} bytes`
+            );
+
+            if (
+                deepgram.readyState ===
+                WebSocket.OPEN
+            ) {
+
+                try {
+
+                    deepgram.send(
+                        data
+                    );
+
+                    console.log(
+                        "➡️ Audio diteruskan ke Deepgram"
+                    );
+
+                } catch (error) {
+
+                    console.error(
+                        "❌ Gagal kirim audio ke Deepgram:",
+                        error.message
+                    );
+                }
+
+            } else {
+
+                console.warn(
+                    "⚠️ Deepgram belum OPEN, audio tidak dikirim."
+                );
+            }
+        }
     );
 
-    if (
-        deepgram.readyState === WebSocket.OPEN
-    ) {
+    // =====================================================
+    // ANDROID CLOSE
+    // =====================================================
 
-        deepgram.send(data);
+    client.on("close", (
+        code,
+        reason
+    ) => {
 
-    } else {
-
-        console.log(
-            "Deepgram belum OPEN, audio tidak dikirim."
-        );
-    }
-});
-
-    client.on("close", () => {
+        clientClosed =
+            true;
 
         console.log(
-            "Android terputus dari STT"
+            "🔴 Android terputus dari STT"
         );
+
+        console.log(
+            "Code:",
+            code
+        );
+
+        console.log(
+            "Reason:",
+            reason.toString()
+        );
+
+        if (
+            keepAliveTimer
+        ) {
+
+            clearInterval(
+                keepAliveTimer
+            );
+
+            keepAliveTimer =
+                null;
+        }
 
         if (
             deepgram.readyState ===
             WebSocket.OPEN
         ) {
 
-            deepgram.close();
+            try {
+
+                deepgram.close(
+                    1000,
+                    "Android disconnected"
+                );
+
+            } catch (error) {
+
+                console.error(
+                    "Error menutup Deepgram:",
+                    error.message
+                );
+            }
         }
     });
+
+    // =====================================================
+    // ANDROID ERROR
+    // =====================================================
+
+    client.on("error", (error) => {
+
+        console.error(
+            "❌ Android WebSocket error:",
+            error.message
+        );
+    });
 });
+
+// =========================================================
+// SERVER
+// =========================================================
 
 server.listen(
     PORT,
@@ -204,7 +558,15 @@ server.listen(
     () => {
 
         console.log(
+            "================================="
+        );
+
+        console.log(
             `🚀 CallText STT server berjalan di port ${PORT}`
+        );
+
+        console.log(
+            "================================="
         );
     }
 );
